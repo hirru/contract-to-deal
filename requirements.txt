@@ -1,0 +1,9 @@
+streamlit
+fillpdf
+pymupdf  
+pdfplumber  
+reportlab  
+pytz 
+python-dotenv 
+langchain==0.0.352
+langchain-openai==0.0.8 
