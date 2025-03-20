@@ -367,8 +367,8 @@ def main():
                     api_response = send_to_api(mapped_fields)
                     if api_response:
                         st.success("API call successful!")
-                        st.write("**API Response:**")
-                        st.json(api_response)
+                        # st.write("**API Response:**")
+                        # st.json(api_response)
                     else:
                         st.error("Failed to send data to API.")
                 else:
