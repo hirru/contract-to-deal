@@ -18,7 +18,6 @@ def load_pdf_and_extract_text(pdf_path):
         loader = PyPDFLoader(pdf_path)
         pages = loader.load()  # Load all pages
         text = " ".join(page.page_content for page in pages)  # Combine all pages into a single text
-        print(text)
         return text
     except Exception as e:
         st.error(f"Error in load_pdf_and_extract_text: {e}")
@@ -382,6 +381,197 @@ def send_to_api(mapped_fields):
         st.error(f"Error in send_to_api: {e}")
         return None
 
+
+import fitz  # PyMuPDF for better PDF handling
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import SequentialChain, LLMChain
+from langchain.prompts import PromptTemplate
+from langchain.output_parsers import PydanticOutputParser
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class ContractData(BaseModel):
+    """Pydantic model for contract data validation"""
+    contact_name: Optional[str] = Field(None, description="Full name of the contact person")
+    billing_address: Optional[str] = Field(None, description="Complete billing address")
+    city: Optional[str] = Field(None, description="City name")
+    state: Optional[str] = Field(None, description="State name")
+    zip: Optional[str] = Field(None, description="ZIP/Postal code")
+    contact_phone: Optional[str] = Field(None, description="Contact phone number")
+    fax: Optional[str] = Field(None, description="Fax number")
+    email: Optional[str] = Field(None, description="Email address")
+    tax_exempt: Optional[str] = Field(None, description="Tax exempt status (yes/no)")
+    account_number: Optional[str] = Field(None, description="Account number")
+    service_address_1: Optional[str] = Field(None, description="Service address line 1")
+    service_address_2: Optional[str] = Field(None, description="Service address line 2")
+    utility: Optional[str] = Field(None, description="Utility type")
+    contract_term: Optional[str] = Field(None, description="Contract term duration")
+    price: Optional[str] = Field(None, description="Price/Rate information")
+
+class SmartContractExtractor:
+    def __init__(self, api_key):
+        self.llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            api_key=api_key,
+            temperature=0.2  # Lower temperature for more consistent outputs
+        )
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=4000,
+            chunk_overlap=200,  # Overlap to maintain context
+            separators=["\n\n", "\n", ".", " "],
+            length_function=len
+        )
+        self.parser = PydanticOutputParser(pydantic_object=ContractData)
+
+    def extract_pdf_with_layout(self, pdf_path):
+        """Extract text while preserving layout information"""
+        doc = fitz.open(pdf_path)
+        text_with_layout = []
+        
+        for page in doc:
+            # Extract text blocks with positions
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text_with_layout.append({
+                                "text": span["text"],
+                                "position": (span["bbox"][0], span["bbox"][1]),
+                                "font_size": span["size"]
+                            })
+        return text_with_layout
+
+    def analyze_document_structure(self, text_with_layout):
+        """Analyze document structure to identify sections and key areas"""
+        structure_prompt = PromptTemplate(
+            template="""Analyze this document structure and identify key sections:
+            {text_with_layout}
+            
+            Identify the locations of:
+            1. Header information
+            2. Contact details
+            3. Service details
+            4. Pricing information
+            5. Terms and conditions
+            
+            Return the section locations and their importance.""",
+            input_variables=["text_with_layout"]
+        )
+        
+        structure_chain = LLMChain(llm=self.llm, prompt=structure_prompt)
+        return structure_chain.run(text_with_layout=str(text_with_layout))
+
+    def extract_fields(self, pdf_path):
+        """Main extraction method with improved accuracy"""
+        try:
+            # Get text with layout information
+            text_with_layout = self.extract_pdf_with_layout(pdf_path)
+            
+            # Analyze document structure
+            doc_structure = self.analyze_document_structure(text_with_layout)
+            
+            # Split text into chunks
+            text_chunks = self.text_splitter.split_text(
+                " ".join([item["text"] for item in text_with_layout])
+            )
+            
+            # Initialize results
+            all_results = []
+            
+            # Process each chunk with context
+            for chunk in text_chunks:
+                extraction_prompt = PromptTemplate(
+                    template="""Based on document analysis: {doc_structure}
+                    
+                    Extract contract information from this section:
+                    {chunk}
+                    
+                    Focus on finding these fields if present:
+                    - Contact name
+                    - Billing address
+                    - Contact details
+                    - Service information
+                    - Pricing details
+                    
+                    Format as JSON matching this schema:
+                    {format_instructions}
+                    
+                    Only include fields you're confident about.""",
+                    input_variables=["doc_structure", "chunk"],
+                    partial_variables={"format_instructions": self.parser.get_format_instructions()}
+                )
+                
+                # Extract information
+                chain = LLMChain(llm=self.llm, prompt=extraction_prompt)
+                result = chain.run(doc_structure=doc_structure, chunk=chunk)
+                
+                try:
+                    parsed_result = self.parser.parse(result)
+                    all_results.append(parsed_result)
+                except Exception as e:
+                    continue
+            
+            # Merge results with confidence scoring
+            final_result = self.merge_results(all_results)
+            
+            # Validate final result
+            return self.validate_results(final_result)
+            
+        except Exception as e:
+            raise Exception(f"Extraction failed: {str(e)}")
+
+    def merge_results(self, results):
+        """Merge results with confidence scoring"""
+        merged = ContractData()
+        confidence_scores = {}
+        
+        for field in ContractData.__fields__:
+            field_values = [getattr(r, field) for r in results if getattr(r, field)]
+            if field_values:
+                # Use most common value with confidence score
+                value_counts = {}
+                for value in field_values:
+                    value_counts[value] = value_counts.get(value, 0) + 1
+                
+                most_common = max(value_counts.items(), key=lambda x: x[1])
+                confidence = most_common[1] / len(results)
+                
+                setattr(merged, field, most_common[0])
+                confidence_scores[field] = confidence
+        
+        return merged, confidence_scores
+
+    def validate_results(self, result_tuple):
+        """Validate extracted results"""
+        result, confidence_scores = result_tuple
+        
+        validation_prompt = PromptTemplate(
+            template="""Validate this extracted contract information:
+            {result}
+            
+            Confidence scores: {confidence_scores}
+            
+            Check for:
+            1. Data consistency
+            2. Required fields presence
+            3. Format validity
+            
+            Return validated data or highlight issues.""",
+            input_variables=["result", "confidence_scores"]
+        )
+        
+        validation_chain = LLMChain(llm=self.llm, prompt=validation_prompt)
+        validation_result = validation_chain.run(
+            result=result.dict(),
+            confidence_scores=confidence_scores
+        )
+        
+        return {
+            "data": result.dict(),
+            "confidence_scores": confidence_scores,
+            "validation": validation_result
+        }
 # Streamlit App
 def main():
     st.title("AI-Powered Contract Processing POC")
@@ -404,11 +594,14 @@ def main():
 
             # Step 2: Extract fields using GPT
             st.write("Extracting fields using GPT...")
-            extracted_data = extract_fields_with_gpt(text, openai_api_key)
-            if extracted_data:
+            extractor = SmartContractExtractor(openai_api_key)
+            extracted_data = extractor.extract_fields(temp_file_path)
+            print(extracted_data)
+            # extracted_data = extract_fields_with_gpt(text, openai_api_key)
+            if extracted_data['data']:
                 st.success("Field extraction successful!")
                 st.write("**Extracted Data:**")
-                st.json(extracted_data)  # Show extracted data in JSON format
+                st.json(extracted_data["data"])  # Show extracted data in JSON format
 
                 # Step 3: Map fields to API schema
                 st.write("Mapping fields to API schema...")
