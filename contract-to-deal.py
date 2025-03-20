@@ -5,8 +5,6 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_openai import ChatOpenAI  # Use OpenAI's GPT model
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains.summarize import load_summarize_chain
 
 
 # Deal API endpoint and key
@@ -25,59 +23,64 @@ def load_pdf_and_extract_text(pdf_path):
     except Exception as e:
         st.error(f"Error in load_pdf_and_extract_text: {e}")
         return None
-
-def chunk_and_summarize_text(text, open_api_key):
-    """Split long text into chunks and summarize relevant parts"""
-    try:
-        # Initialize text splitter
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=4000,
-            chunk_overlap=200,
-            length_function=len
-        )
-        
-        # Split text into chunks
-        chunks = text_splitter.split_text(text)
-        
-        # Initialize the GPT model for summarization
-        llm = ChatOpenAI(
-            model="gpt-3.5-turbo",  # Use cheaper model for summarization
-            api_key=open_api_key,
-            temperature=0.3
-        )
-        
-        # Create summarization prompt
-        summary_prompt = ChatPromptTemplate.from_messages([
-            ("system", """Extract only the relevant contract information from this text chunk.
-            Focus on: contact details, billing information, service details, pricing, and terms.
-            Ignore any non-essential text or formatting."""),
-            ("user", "{text}")
-        ])
-        
-        # Summarize each chunk
-        summarized_text = ""
-        for chunk in chunks:
-            response = llm.predict(summary_prompt.format(text=chunk))
-            summarized_text += response + "\n"
-        
-        return summarized_text
-
-    except Exception as e:
-        raise Exception(f"Error in chunking and summarizing text: {str(e)}")
+    
+def chunk_text(text, max_tokens=4000):
+    """Split text into smaller chunks, approximately max_tokens in size"""
+    # Rough estimate: 1 token ≈ 4 characters for English text
+    max_chars = max_tokens * 4
+    
+    # Split text into sentences
+    sentences = text.replace('\n', '. ').split('. ')
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for sentence in sentences:
+        if current_length + len(sentence) < max_chars:
+            current_chunk.append(sentence)
+            current_length += len(sentence)
+        else:
+            chunks.append('. '.join(current_chunk))
+            current_chunk = [sentence]
+            current_length = len(sentence)
+    
+    if current_chunk:
+        chunks.append('. '.join(current_chunk))
+    
+    return chunks
 
 # Step 2: Use GPT to extract fields
 def extract_fields_with_gpt(text, open_api_key):
     try:
-        # First, chunk and summarize the text
-        summarized_text = chunk_and_summarize_text(text, open_api_key)
         # Initialize the GPT model
         llm = ChatOpenAI(
-            model="gpt-4",  # Use GPT-4 or GPT-3.5-turbo
+            model="gpt-4o-mini",  # Using 16k version for larger context
             api_key=open_api_key,
-            temperature=0.7
+            temperature=0.7,
+            max_tokens=1000  # Limit response size
         )
 
-        # Define the JSON output parser
+        chunks = chunk_text(text)
+
+        result = {
+            "contact_name": "",
+            "billing_address": "",
+            "city": "",
+            "state": "",
+            "zip": "",
+            "contact_phone": "",
+            "fax": "",
+            "email": "",
+            "tax_exempt": "",
+            "account_number": "",
+            "service_address_1": "",
+            "service_address_2": "",
+            "utility": "",
+            "contract_term": "",
+            "price": ""
+        }
+
         parser = JsonOutputParser(pydantic_object={
             "type": "object",
             "properties": {
@@ -99,8 +102,9 @@ def extract_fields_with_gpt(text, open_api_key):
             }
         })
 
-        # Define the prompt template
-        prompt = ChatPromptTemplate.from_messages([
+        # Define the JSON output parser
+        for chunk in chunks:
+            prompt = ChatPromptTemplate.from_messages([
             ("system", """Extract contract details into JSON with this structure:
                 {{
                     "contact_name": "name here",
@@ -120,18 +124,27 @@ def extract_fields_with_gpt(text, open_api_key):
                     "price": "price here"
                 }}"""),
             ("user", "{input}")
-        ])
+            ])
+        
+            chain = prompt | llm | parser
 
-        # Create the chain
-        chain = prompt | llm | parser
+            # Process chunk
+            chunk_result = chain.invoke({"input": chunk})
+            
+            # Update main result with any new information
+            for key, value in chunk_result.items():
+                if value and not result[key]:  # Only update if we found new information
+                    result[key] = value
 
-        # Pass the entire text to the GPT model
-        result = chain.invoke({"input": summarized_text})
+            # If we have all fields filled, break early
+            if all(result.values()):
+                break
+
         return result
 
     except Exception as e:
         st.error(f"Error in extract_fields_with_gpt: {e}")
-        return None
+        return None 
 
 # Step 3: Map extracted data to API schema
 def map_fields(extracted_data):
@@ -402,8 +415,8 @@ def main():
                 mapped_fields = map_fields(extracted_data)
                 if mapped_fields:
                     st.success("Field mapping successful!")
-                    st.write("**Mapped Fields:**")
-                    st.json(mapped_fields)
+                    # st.write("**Mapped Fields:**")
+                    # st.json(mapped_fields)
 
                     # Step 4: Send to API
                     st.write("Sending data to API...")
