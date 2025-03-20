@@ -56,8 +56,8 @@ def extract_fields_with_gpt(text, open_api_key):
             }
         })
 
-        # Define the prompt template
-        prompt = ChatPromptTemplate.from_messages([
+        # Define the prompt template for extraction
+        extraction_prompt = ChatPromptTemplate.from_messages([
             ("system", """Extract contract details into JSON with this structure:
                 {{
                     "contact_name": "name here",
@@ -75,16 +75,87 @@ def extract_fields_with_gpt(text, open_api_key):
                     "utility": "utility type here",
                     "contract_term": "term here",
                     "price": "price here"
-                }}"""),
+                }}
+                
+                If you can't find all fields, extract what you can find and leave the rest as empty strings.
+                """),
             ("user", "{input}")
         ])
 
-        # Create the chain
-        chain = prompt | llm | parser
+        # Define a prompt template for merging results from multiple chunks
+        merge_prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are given multiple JSON objects extracted from different parts of the same document.
+                Merge them into a single JSON object with the most complete and accurate information.
+                If there are conflicts, prefer the most specific and detailed information.
+                Return a single JSON object with this structure:
+                {{
+                    "contact_name": "name here",
+                    "billing_address": "address here",
+                    "city": "city name here",
+                    "state": "state name here",
+                    "zip": "zip code here",
+                    "contact_phone": "phone number here",
+                    "fax": "fax number here",
+                    "email": "email here",
+                    "tax_exempt": "yes or no",
+                    "account_number": "account number here",
+                    "service_address_1": "address line 1",
+                    "service_address_2": "address line 2",
+                    "utility": "utility type here",
+                    "contract_term": "term here",
+                    "price": "price here"
+                }}"""),
+            ("user", "Here are the JSON objects to merge: {input}")
+        ])
 
-        # Pass the entire text to the GPT model
-        result = chain.invoke({"input": text})
-        return result
+         # Create the extraction chain
+        extraction_chain = extraction_prompt | llm | parser
+        
+        # Create the merge chain
+        merge_chain = merge_prompt | llm | parser
+
+        # Check if the text is too large (approx. 60k tokens is around 80k characters)
+        # This is a conservative estimate to stay well under the 128k token limit
+        if len(text) > 80000:
+            st.info("Document is large, processing in chunks...")
+            
+            # Split the text into manageable chunks
+            # Using a simple character-based chunking approach with overlap
+            chunk_size = 60000  # Characters per chunk (approx. 45k tokens)
+            overlap = 5000      # Overlap between chunks to avoid missing information at boundaries
+            
+            chunks = []
+            start = 0
+            while start < len(text):
+                end = min(start + chunk_size, len(text))
+                chunks.append(text[start:end])
+                start = end - overlap
+                if start >= len(text):
+                    break
+            
+            st.info(f"Processing {len(chunks)} chunks...")
+            
+            # Process each chunk and collect results
+            chunk_results = []
+            for i, chunk in enumerate(chunks):
+                st.info(f"Processing chunk {i+1}/{len(chunks)}...")
+                try:
+                    result = extraction_chain.invoke({"input": chunk})
+                    chunk_results.append(result)
+                except Exception as chunk_error:
+                    st.warning(f"Error processing chunk {i+1}: {str(chunk_error)}")
+            
+            # Merge the results from all chunks
+            if chunk_results:
+                st.info("Merging results from all chunks...")
+                merged_result = merge_chain.invoke({"input": str(chunk_results)})
+                return merged_result
+            else:
+                raise Exception("Failed to extract information from any chunk")
+        else:
+            # For smaller documents, process the entire text at once
+            result = extraction_chain.invoke({"input": text})
+            return result
 
     except Exception as e:
         st.error(f"Error in extract_fields_with_gpt: {e}")
@@ -348,7 +419,8 @@ def main():
 
             # Step 2: Extract fields using GPT
             st.write("Extracting fields using GPT...")
-            extracted_data = extract_fields_with_gpt(text, openai_api_key)
+            with st.spinner("This may take a while for large documents as they will be processed in chunks..."):
+                    extracted_data = extract_fields_with_gpt(text, openai_api_key)
             if extracted_data:
                 st.success("Field extraction successful!")
                 st.write("**Extracted Data:**")
