@@ -5,6 +5,8 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_openai import ChatOpenAI  # Use OpenAI's GPT model
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains.summarize import load_summarize_chain
 
 
 # Deal API endpoint and key
@@ -24,12 +26,53 @@ def load_pdf_and_extract_text(pdf_path):
         st.error(f"Error in load_pdf_and_extract_text: {e}")
         return None
 
+def chunk_and_summarize_text(text, open_api_key):
+    """Split long text into chunks and summarize relevant parts"""
+    try:
+        # Initialize text splitter
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=4000,
+            chunk_overlap=200,
+            length_function=len
+        )
+        
+        # Split text into chunks
+        chunks = text_splitter.split_text(text)
+        
+        # Initialize the GPT model for summarization
+        llm = ChatOpenAI(
+            model="gpt-3.5-turbo",  # Use cheaper model for summarization
+            api_key=open_api_key,
+            temperature=0.3
+        )
+        
+        # Create summarization prompt
+        summary_prompt = ChatPromptTemplate.from_messages([
+            ("system", """Extract only the relevant contract information from this text chunk.
+            Focus on: contact details, billing information, service details, pricing, and terms.
+            Ignore any non-essential text or formatting."""),
+            ("user", "{text}")
+        ])
+        
+        # Summarize each chunk
+        summarized_text = ""
+        for chunk in chunks:
+            response = llm.predict(summary_prompt.format(text=chunk))
+            summarized_text += response + "\n"
+        
+        return summarized_text
+
+    except Exception as e:
+        raise Exception(f"Error in chunking and summarizing text: {str(e)}")
+
 # Step 2: Use GPT to extract fields
 def extract_fields_with_gpt(text, open_api_key):
     try:
+        # First, chunk and summarize the text
+        summarized_text = chunk_and_summarize_text(text, open_api_key)
         # Initialize the GPT model
         llm = ChatOpenAI(
-            model="gpt-4o-mini",  # Use GPT-4 or GPT-3.5-turbo
+            model="gpt-4",  # Use GPT-4 or GPT-3.5-turbo
             api_key=open_api_key,
             temperature=0.7
         )
@@ -83,7 +126,7 @@ def extract_fields_with_gpt(text, open_api_key):
         chain = prompt | llm | parser
 
         # Pass the entire text to the GPT model
-        result = chain.invoke({"input": text})
+        result = chain.invoke({"input": summarized_text})
         return result
 
     except Exception as e:
